@@ -7,7 +7,7 @@ from flax.linen.initializers import constant, orthogonal
 from typing import Sequence, NamedTuple, Any, Dict
 from flax.training.train_state import TrainState
 import distrax
-from envs.wrappers import LogWrapper
+from envs.wrappers import PopJaxWrapper, RandomProjectionWrapper, LogWrapper
 from gymnax.environments import spaces
 from .s5 import init_S5SSM, make_DPLR_HiPPO, StackedEncoderModel
 import wandb
@@ -42,16 +42,21 @@ class ActorCriticS5(nn.Module):
             self.log_std = self.param('log_std', nn.initializers.zeros, (self.action_dim,))
 
     def __call__(self, hidden, x):
+        # input : [past infos] hidden, [current info] x = observation + done signal 
         obs, dones = x
         if self.config.get("NO_RESET"):
             dones = jnp.zeros_like(dones)
+        
+        # embedding observation 
         embedding = self.encoder_0(obs)
         embedding = nn.leaky_relu(embedding)
         embedding = self.encoder_1(embedding)
         embedding = nn.leaky_relu(embedding)
 
+        # predict next embedding observation ?  
         hidden, embedding = self.s5(hidden, embedding, dones)
 
+        # actor - policy  
         actor_mean = self.action_body_0(embedding)
         actor_mean = nn.leaky_relu(actor_mean)
         actor_mean = self.action_body_1(actor_mean)
@@ -63,22 +68,24 @@ class ActorCriticS5(nn.Module):
         else:
             pi = distrax.Categorical(logits=actor_mean)
 
+        # critic - value 
         critic = self.value_body_0(embedding)
         critic = nn.leaky_relu(critic)
         critic = self.value_body_1(critic)
         critic = nn.leaky_relu(critic)
         critic = self.value_decoder(critic)
 
+        # output : hidden, policy, value 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
-class Transition(NamedTuple):
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: jnp.ndarray
-    info: jnp.ndarray
+class Transition(NamedTuple):  # info about single step 
+    done: jnp.ndarray  # whether episode is done 
+    action: jnp.ndarray  # selected action 
+    value: jnp.ndarray  # predicted value 
+    reward: jnp.ndarray  # reward 
+    log_prob: jnp.ndarray  # log probability of selected action 
+    obs: jnp.ndarray  # last observation 
+    info: jnp.ndarray  # additional info from env 
 
 def symlog(x):
     return jnp.sign(x) * jnp.log(jnp.abs(x) + 1)
@@ -90,10 +97,22 @@ def make_train(config):
     config["MINIBATCH_SIZE"] = (
         config["NUM_ENVS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
-    env, env_params = config["ENV"], config["ENV_PARAMS"]
+    
+    # env sample 
+    rng, _rng = jax.random.split(rng)
+    env_sampler = config['ENV_SAMPLER']
+    env = env_sampler.sample(_rng)
+    # env step format wrap 
+    env = PopJaxWrapper(env)
+    # env random project obs+act wrap 
+    O = config["PROJ_OBS_SIZE"]
+    A = config["PROJ_ACT_SIZE"]
+    env = RandomProjectionWrapper(env, O, A)
+    # env log wrap 
     env = LogWrapper(env)
 
-    config["CONTINUOUS"] = type(env.action_space(env_params)) == spaces.Box 
+    # DMC continous , True 
+    config["CONTINUOUS"] = type(env.action_space()) == spaces.Box 
 
     d_model = config["S5_D_MODEL"]
     ssm_size = config["S5_SSM_SIZE"]
@@ -130,11 +149,11 @@ def make_train(config):
 
         # INIT NETWORK
         if config["CONTINUOUS"]:
-            network = ActorCriticS5(env.action_space(env_params).shape[0], config=config, ssm_init_fn=ssm_init_fn)
+            network = ActorCriticS5(env.action_space().shape[0], config=config, ssm_init_fn=ssm_init_fn)
         else:
-            network = ActorCriticS5(env.action_space(env_params).n, config=config, ssm_init_fn=ssm_init_fn)
+            network = ActorCriticS5(env.action_space().n, config=config, ssm_init_fn=ssm_init_fn)
         rng, _rng = jax.random.split(rng)
-        init_x = (jnp.zeros((1, config["NUM_ENVS"], *env.observation_space(env_params).shape)), jnp.zeros((1, config["NUM_ENVS"])))
+        init_x = (jnp.zeros((1, config["NUM_ENVS"], *env.observation_space().shape)), jnp.zeros((1, config["NUM_ENVS"])))
         init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
         network_params = network.init(_rng, init_hstate, init_x)
         if config["ANNEAL_LR"]:
@@ -145,32 +164,32 @@ def make_train(config):
         else:
             tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]), optax.adam(config["LR"], eps=1e-5))
         train_state = TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
-            tx=tx,
+            apply_fn=network.apply,  # network apply function 
+            params=network_params,  # network parameter 
+            tx=tx,  # optimizer with optax 
         )
 
-        # INIT ENV
+        # INIT ENV (use NUM_ENVS parallelization)
         rng, _rng = jax.random.split(rng)
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         # obsv, env_state = jax.vmap(env.reset, in_axes=(0, None))(reset_rng, env_params)
-        partial_reset = lambda x: env.reset(x, env_params)
-        obsv, env_state = jax.vmap(partial_reset)(reset_rng)
+        partial_reset = lambda x: env.reset(x)
+        obsv, env_state = jax.vmap(partial_reset)(reset_rng)  # vetorize -> parallelization 
         # init_hstate = SequenceLayer.initialize_carry(config["NUM_ENVS"], ssm_size)
-        init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)
+        init_hstate = StackedEncoderModel.initialize_carry(config["NUM_ENVS"], ssm_size, n_layers)  
 
 
         # TRAIN LOOP
-        def _update_step(runner_state, unused):
+        def _update_step(runner_state, unused):  
 
-            # COLLECT TRAJECTORIES
+            # COLLECT TRAJECTORIES 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng = runner_state  # includes current state of agent 
                 rng, _rng = jax.random.split(rng)
 
                 # SELECT ACTION
-                ac_in = (last_obs[np.newaxis, :], last_done[np.newaxis, :])
-                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
+                ac_in = (last_obs[np.newaxis, :], last_done[np.newaxis, :])  
+                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)  
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 value, action, log_prob = value.squeeze(0), action.squeeze(0), log_prob.squeeze(0)
@@ -178,23 +197,26 @@ def make_train(config):
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0,0,0,None))(
-                    rng_step, env_state, action, env_params
+                env_step = lambda env_state, action, rng: env.step(env_state, action)
+                obsv, env_state, reward, done, info = jax.vmap(env_step, in_axes=(0, 0, 0))(
+                    env_state, action, rng_steps
                 )
                 # transition = Transition(done, action, value, reward, log_prob, last_obs, info, last_done)
                 transition = Transition(last_done, action, value, reward, log_prob, last_obs, info)
                 runner_state = (train_state, env_state, obsv, done, hstate, rng)
-                return runner_state, transition
+                return runner_state, transition 
 
             initial_hstate = runner_state[-2]
-            runner_state, traj_batch = jax.lax.scan(_env_step, runner_state, None, config["NUM_STEPS"])
+            runner_state, traj_batch = jax.lax.scan(_env_step, runner_state, None, config["NUM_STEPS"]) 
+            # runner_state: updated state after each step
+            # traj_batch: batches of transition information from each step, used later for training
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng = runner_state  # last step of traj 
             ac_in = (last_obs[np.newaxis, :], last_done[np.newaxis, :])
             _, _, last_val = network.apply(train_state.params, hstate, ac_in)
-            last_val = last_val.squeeze(0)
-            def _calculate_gae(traj_batch, last_val, last_done):
+            last_val = last_val.squeeze(0)  # use last value from critic network 
+            def _calculate_gae(traj_batch, last_val, last_done):  # calculate gae 
                 def _get_advantages(carry, transition):
                     gae, next_value, next_done = carry
                     done, value, reward = transition.done, transition.value, transition.reward 
@@ -256,10 +278,12 @@ def make_train(config):
                     shuffled_batch,
                 )
 
+                # update for each batches 
                 train_state, total_loss = jax.lax.scan(_update_minbatch, train_state, minibatches)
                 update_state = (train_state, init_hstate, traj_batch, advantages, targets, rng)
                 return update_state, total_loss
 
+            # update for epoches 
             init_hstate = initial_hstate # TBH
             update_state = (train_state, init_hstate, traj_batch, advantages, targets, rng)
             update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config["UPDATE_EPOCHS"])
@@ -283,6 +307,8 @@ def make_train(config):
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return runner_state, metric
 
+        # whole batch process (NUM_ENVS(batch) x NUM_UPDATES)
+        # : _update_step (single trajectory collect + update(_update_epoch -> _update_minibatch)   
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ENVS"]), dtype=bool), init_hstate, _rng) 
         runner_state, metric = jax.lax.scan(_update_step, runner_state, None, config["NUM_UPDATES"])
@@ -293,7 +319,7 @@ def make_train(config):
 if __name__ == "__main__":
     config = {
         "LR": 2.5e-4,
-        "NUM_ENVS": 1,
+        "NUM_ENVS": 1, 
         "NUM_STEPS": 128,
         "TOTAL_TIMESTEPS": 1e5,
         "UPDATE_EPOCHS": 1,
